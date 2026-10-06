@@ -555,9 +555,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--max-results",
-        type=int,
-        default=1000,
-        help="Maximum results wanted per role (default: 1000)",
+        type=str,
+        default="1000",
+        help="Maximum results wanted per role, or 'all' for all available (default: 1000)",
     )
     parser.add_argument("--use-supabase", action="store_true",
                         help="Enable Supabase upsert if credentials are set (disabled by default)")
@@ -572,7 +572,15 @@ def main() -> None:
 
     hours_old    = args.hours if args.hours is not None else POST_TIME_MAP.get(args.post_time)
     use_supabase = args.use_supabase
-    max_results  = args.max_results
+
+    if not args.max_results or str(args.max_results).lower() in ("all", "max", "0"):
+        max_results = 1000
+    else:
+        try:
+            max_results = max(1, int(args.max_results))
+        except ValueError:
+            max_results = 1000
+
     role_cd_min  = 2 if args.fast else ROLE_COOLDOWN_MIN
     role_cd_max  = 5 if args.fast else ROLE_COOLDOWN_MAX
     base_delay   = 1.5 if args.fast else BASE_DELAY_SEC

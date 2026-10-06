@@ -16,15 +16,15 @@ on:
           - 'day'
           - 'any'
       max_results:
-        description: 'Max jobs per role (50 recommended for ~2-3 min total run)'
+        description: 'Max jobs per role ("all" fetches all available jobs until exhausted)'
         required: true
-        default: '50'
+        default: 'all'
         type: choice
         options:
-          - '50'
-          - '25'
-          - '100'
+          - 'all'
           - '200'
+          - '100'
+          - '50'
       fetch_descriptions:
         description: 'Fetch Full Descriptions (Leave false for 5x faster LinkedIn)'
         required: true
@@ -80,10 +80,10 @@ jobs:
 
       - name: Scrape LinkedIn Shard ${{ matrix.shard }}
         if: steps.check.outputs.run == 'true' && matrix.board == 'linkedin'
-        timeout-minutes: 60
+        timeout-minutes: 180
         run: |
           POST_TIME="${{ github.event.inputs.post_time || '3week' }}"
-          MAX_RES="${{ github.event.inputs.max_results || '50' }}"
+          MAX_RES="${{ github.event.inputs.max_results || 'all' }}"
           DESC_FLAG="--no-descriptions"
           if [ "${{ github.event.inputs.fetch_descriptions }}" = "true" ]; then
             DESC_FLAG=""
@@ -96,10 +96,10 @@ jobs:
 
       - name: Scrape Indeed Shard ${{ matrix.shard }}
         if: steps.check.outputs.run == 'true' && matrix.board == 'indeed'
-        timeout-minutes: 60
+        timeout-minutes: 180
         run: |
           POST_TIME="${{ github.event.inputs.post_time || '3week' }}"
-          MAX_RES="${{ github.event.inputs.max_results || '50' }}"
+          MAX_RES="${{ github.event.inputs.max_results || 'all' }}"
           python indeed/indeed_68_roles.py --post-time "$POST_TIME" --shard "${{ matrix.shard }}" --fast --max-results "$MAX_RES"
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
