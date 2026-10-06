@@ -378,6 +378,8 @@ def scrape_role(
     hours_old: int | None,
     global_seen_ids: set[str],
     fetch_description: bool,
+    max_results: int = 1000,
+    base_delay_sec: float = BASE_DELAY_SEC,
 ) -> tuple[list[dict], dict]:
     """
     Scrape LinkedIn for one role title.
@@ -390,10 +392,10 @@ def scrape_role(
     offset = 0
     stats = {"batches": 0, "hit_429": False}
 
-    while offset < MAX_RESULTS_PER_ROLE:
+    while offset < max_results:
         # Polite delay between pages
         if offset > 0:
-            delay = BASE_DELAY_SEC + random.uniform(2.0, 5.0)
+            delay = base_delay_sec + random.uniform(1.0, 3.0)
             log.info(f"    Sleeping {delay:.1f}s between pages...")
             time.sleep(delay)
 
@@ -586,15 +588,43 @@ def main() -> None:
         help="Explicit max hours old (overrides --post-time, e.g. 504 for 3 weeks)",
     )
     parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Enable fast mode: drops cooldowns between roles to 3-6s and reduces page delays",
+    )
+    parser.add_argument(
+        "--shard",
+        type=str,
+        default=None,
+        help="Run only a partition of roles, e.g. 1/4, 2/4 (for parallel GitHub Actions runners)",
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=1000,
+        help="Maximum results wanted per role (default: 1000)",
+    )
+    parser.add_argument(
         "--use-supabase",
         action="store_true",
         help="Enable Supabase upsert if credentials are set (disabled by default)",
     )
     args = parser.parse_args()
 
+    global JSON_FILE, CSV_FILE, STATE_FILE
+    if args.shard:
+        shard_label = args.shard.replace("/", "-")
+        JSON_FILE  = OUTPUT_DIR / f"linkedin_shard_{shard_label}_jobs.json"
+        CSV_FILE   = OUTPUT_DIR / f"linkedin_shard_{shard_label}_jobs.csv"
+        STATE_FILE = OUTPUT_DIR / f"linkedin_shard_{shard_label}_state.json"
+
     hours_old        = args.hours if args.hours is not None else POST_TIME_MAP.get(args.post_time)
     use_supabase     = args.use_supabase
     fetch_description = not args.no_descriptions
+    max_results      = args.max_results
+    role_cd_min      = 3 if args.fast else ROLE_COOLDOWN_MIN
+    role_cd_max      = 6 if args.fast else ROLE_COOLDOWN_MAX
+    base_delay       = 2.0 if args.fast else BASE_DELAY_SEC
 
     log.info("=" * 65)
     log.info("LINKEDIN 68-ROLES SCRAPER")
@@ -627,15 +657,17 @@ def main() -> None:
             return
         log.info(f"  Filtered to {len(roles_to_run)} role(s) by name: {roles_to_run}")
 
-    if args.limit:
-        roles_to_run = roles_to_run[: args.limit]
-        log.info(f"  Limited to first {args.limit} roles.")
-
-    if args.start_idx > 1 or args.end_idx is not None:
-        start_index = max(0, args.start_idx - 1)
-        end_index   = args.end_idx if args.end_idx is not None else len(roles_to_run)
-        roles_to_run = roles_to_run[start_index:end_index]
-        log.info(f"  Limited to roles {start_index + 1} through {end_index}.")
+    if args.shard:
+        try:
+            part, total = map(int, args.shard.split("/"))
+            chunk_size = math.ceil(len(roles_to_run) / total)
+            start_i = (part - 1) * chunk_size
+            end_i = min(len(roles_to_run), part * chunk_size)
+            roles_to_run = roles_to_run[start_i:end_i]
+            log.info(f"  Shard {args.shard}: running roles {start_i + 1} through {end_i} ({len(roles_to_run)} roles)")
+        except Exception as e:
+            log.error(f"Invalid shard format '{args.shard}': {e}")
+            return
 
     run_jobs:       list[dict] = []
     hot_remaining:  int        = 0
@@ -657,7 +689,7 @@ def main() -> None:
                 hot_remaining = max(0, hot_remaining - 1)
                 log.info(f"  [HOT cooldown] Sleeping {cooldown:.0f}s...")
             else:
-                cooldown = random.uniform(ROLE_COOLDOWN_MIN, ROLE_COOLDOWN_MAX)
+                cooldown = random.uniform(role_cd_min, role_cd_max)
                 log.info(f"  Sleeping {cooldown:.0f}s before next role...")
             time.sleep(cooldown)
 
@@ -668,6 +700,8 @@ def main() -> None:
                 hours_old=hours_old,
                 global_seen_ids=global_seen_ids,
                 fetch_description=fetch_description,
+                max_results=max_results,
+                base_delay_sec=base_delay,
             )
         except KeyboardInterrupt:
             log.warning("\nInterrupted — saving state...")
