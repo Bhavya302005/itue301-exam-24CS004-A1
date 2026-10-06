@@ -1,0 +1,143 @@
+name: Scrape LinkedIn & Indeed 68 Roles
+
+on:
+  schedule:
+    # Run periodically (every 3 weeks)
+    - cron: '0 0 */21 * *'
+  workflow_dispatch:
+    inputs:
+      post_time:
+        description: 'Post time window'
+        required: true
+        default: '3week'
+        type: choice
+        options:
+          - '3week'
+          - '2week'
+          - 'week'
+          - 'month'
+          - 'day'
+          - 'any'
+      boards:
+        description: 'Which boards to scrape'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - 'both'
+          - 'linkedin'
+          - 'indeed'
+      roles_limit:
+        description: 'Limit number of roles (0 for all 68)'
+        required: false
+        default: '0'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [linkedin, indeed]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine if board should execute
+        id: check
+        run: |
+          SELECTED="${{ github.event.inputs.boards || 'both' }}"
+          CURRENT="${{ matrix.board }}"
+          if [ "$SELECTED" != "both" ] && [ "$SELECTED" != "$CURRENT" ]; then
+            echo "run=false" >> $GITHUB_OUTPUT
+          else
+            echo "run=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        if: steps.check.outputs.run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install python-jobspy pandas python-dotenv openpyxl
+
+      - name: Scrape LinkedIn (68 Roles)
+        if: steps.check.outputs.run == 'true' && matrix.board == 'linkedin'
+        timeout-minutes: 360
+        run: |
+          POST_TIME="${{ github.event.inputs.post_time || '3week' }}"
+          LIMIT_FLAG=""
+          if [ "${{ github.event.inputs.roles_limit || '0' }}" != "0" ]; then
+            LIMIT_FLAG="--limit ${{ github.event.inputs.roles_limit }}"
+          fi
+          python linkedin/linkedin_68_roles.py --post-time "$POST_TIME" $LIMIT_FLAG
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PYTHONUNBUFFERED: "1"
+
+      - name: Scrape Indeed (68 Roles)
+        if: steps.check.outputs.run == 'true' && matrix.board == 'indeed'
+        timeout-minutes: 360
+        run: |
+          POST_TIME="${{ github.event.inputs.post_time || '3week' }}"
+          LIMIT_FLAG=""
+          if [ "${{ github.event.inputs.roles_limit || '0' }}" != "0" ]; then
+            LIMIT_FLAG="--limit ${{ github.event.inputs.roles_limit }}"
+          fi
+          python indeed/indeed_68_roles.py --post-time "$POST_TIME" $LIMIT_FLAG
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PYTHONUNBUFFERED: "1"
+
+      - name: Upload Artifacts
+        if: steps.check.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jobs-${{ matrix.board }}
+          path: |
+            linkedin/linkedin_jobs/*
+            indeed/indeed_jobs/*
+          if-no-files-found: ignore
+
+  commit:
+    needs: scrape
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all job artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scraped_artifacts/
+
+      - name: Move artifacts to target directories
+        run: |
+          if [ -d "scraped_artifacts/jobs-linkedin" ]; then
+            mkdir -p linkedin/linkedin_jobs
+            cp -r scraped_artifacts/jobs-linkedin/* linkedin/linkedin_jobs/ 2>/dev/null || true
+          fi
+          if [ -d "scraped_artifacts/jobs-indeed" ]; then
+            mkdir -p indeed/indeed_jobs
+            cp -r scraped_artifacts/jobs-indeed/* indeed/indeed_jobs/ 2>/dev/null || true
+          fi
+          rm -rf scraped_artifacts
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Automated LinkedIn & Indeed 68 roles update (3-week window) 🤖"
+          file_pattern: 'linkedin/linkedin_jobs/* indeed/indeed_jobs/*'
+          commit_author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>

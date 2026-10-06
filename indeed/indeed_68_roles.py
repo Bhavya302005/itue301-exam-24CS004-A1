@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""
+Indeed 68-Roles Job Scraper
+===========================
+Scrapes Indeed for all 68 procurement/sourcing/buying roles, with:
+
+  - Configurable post time  (--post-time hour|day|3day|week|month|any)
+  - US-only results         (--location / --country flags)
+  - Role-level deduplication via MD5 of (title+company+location)
+  - Incremental state saves  -> safe to Ctrl-C and resume (--resume)
+  - Adaptive rate-limiting  -> detects 429s and backs off automatically
+  - Exponential backoff     -> up to MAX_RETRIES per batch
+  - Short-page detection    -> stops early when Indeed returns partial pages
+  - Indeed's ~1000-result cap per role is handled gracefully
+  - Single merged JSON + CSV output (all roles in one file)
+  - Optional Supabase upsert (reads SUPABASE_URL / SUPABASE_KEY from .env)
+
+Usage
+-----
+  # Basic (last 7 days, USA):
+  python3 indeed/indeed_68_roles.py
+
+  # Custom time window:
+  python3 indeed/indeed_68_roles.py --post-time month
+
+  # Resume a killed run:
+  python3 indeed/indeed_68_roles.py --resume
+
+  # Only one role (for testing):
+  python3 indeed/indeed_68_roles.py --role "Procurement Manager"
+
+  # Different location:
+  python3 indeed/indeed_68_roles.py --location "New York" --post-time week
+
+Requirements
+------------
+  pip install python-jobspy pandas python-dotenv
+"""
+
+from __future__ import annotations
+
+import sys
+import os
+import csv
+import json
+import math
+import time
+import random
+import hashlib
+import logging
+import argparse
+from datetime import datetime, date, timezone
+from pathlib import Path
+from typing import Any
+
+# -- Dependency checks --------------------------------------------------------
+try:
+    import pandas as pd
+    from jobspy import scrape_jobs
+except ImportError as exc:
+    print(
+        f"ERROR: Missing required package: {exc.name}.\n"
+        "Run: pip install python-jobspy pandas"
+    )
+    raise SystemExit(1)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env")
+except ImportError:
+    pass  # optional
+
+# -- Optional Supabase --------------------------------------------------------
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+try:
+    import httpx as _httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
+
+# -- Optional local enrichment ------------------------------------------------
+try:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from scraper_utils import enrich_raw_job  # type: ignore
+except Exception:
+    def enrich_raw_job(j: dict) -> dict:  # type: ignore[misc]
+        return j
+
+# -- 68 Roles -----------------------------------------------------------------
+
+ROLES: list[str] = [
+    "Senior Commodity Manager",
+    "Commodity Manager",
+    "Commodity Buyer",
+    "Commodity Lead",
+    "Purchasing Commodity Manager",
+    "Senior Commodity Buyer",
+    "Global Supply Chain Analyst",
+    "Global Supply Chain Specialist",
+    "Global Supply Chain Lead",
+    "Global Sourcing Specialist",
+    "Global Commodity Manager",
+    "Global Supply Chain Manager",
+    "Commodity Specialist",
+    "Procurement Manager",
+    "Procurement Specialist",
+    "Senior Procurement Specialist",
+    "Senior Procurement Manager",
+    "Assistant Procurement Manager",
+    "Procurement Associate",
+    "Senior Procurement Analyst",
+    "Senior Procurement Officer",
+    "Senior Procurement Engineer",
+    "Senior Procurement Consultant",
+    "Head of Procurement",
+    "Procurement Officer",
+    "Procurement Coordinator",
+    "Procurement Engineer",
+    "Procurement Assistant",
+    "Sourcing Manager",
+    "Sourcing Specialist",
+    "Strategic Sourcing Manager",
+    "Senior Manager Strategic Sourcing",
+    "Senior Sourcing Analyst",
+    "Senior Sourcing Manager",
+    "Senior Sourcing Specialist",
+    "Assistant Sourcing Manager",
+    "Global Sourcing Lead",
+    "Senior Manager Global Sourcing",
+    "Strategic Sourcing Specialist",
+    "Sourcing Lead",
+    "Buyer",
+    "Senior Buyer",
+    "Purchasing Manager",
+    "Purchasing Representative",
+    "Procurement Buyer",
+    "Commodity Analyst",
+    "Senior Purchasing Agent",
+    "Senior Purchasing Specialist",
+    "Assistant Purchasing Agent",
+    "Purchasing Assistant",
+    "Senior Purchasing Analyst",
+    "Senior Purchasing Officer",
+    "Purchasing Coordinator",
+    "Associate Buyer",
+    "Senior Purchasing Assistant",
+    "Purchasing Supervisor",
+    "Purchase Specialist",
+    "Junior Buyer",
+    "Purchasing Officer",
+    "Senior Purchasing Manager",
+    "Purchasing Analyst",
+    "Purchasing Buyer",
+    "Materials Buyer",
+    "Assistant Buyer",
+    "Assistant Purchasing Manager",
+    "Purchasing Consultant",
+    "Purchasing Associate",
+    "Purchasing Agent",
+]
+
+# -- Rate-limit / retry tuning ------------------------------------------------
+BATCH_SIZE           = 50     # jobs per Indeed API call
+MAX_RESULTS_PER_ROLE = 1000   # Indeed's hard cap per query
+MAX_RETRIES          = 5      # non-429 retries per batch
+MAX_429_PAUSES       = 3      # 429-specific pauses before giving up on a batch
+BASE_DELAY_SEC       = 4      # baseline sleep between pages (seconds)
+ROLE_COOLDOWN_MIN    = 15     # min sleep between roles (normal)
+ROLE_COOLDOWN_MAX    = 28     # max sleep between roles (normal)
+HOT_COOLDOWN_MIN     = 60     # min sleep after a 429 event
+HOT_COOLDOWN_MAX     = 90     # max sleep after a 429 event
+HOT_STREAK_ROLES     = 3      # roles to stay on hot cooldown after a 429
+BACKOFF_429_SEC      = 300    # hard 5-min pause on 429 detection
+
+# -- Post-time mapping --------------------------------------------------------
+POST_TIME_MAP: dict[str, int | None] = {
+    "hour":   1,
+    "day":    24,
+    "3day":   72,
+    "week":   168,
+    "2week":  336,
+    "3week":  504,
+    "month":  720,
+    "any":    None,
+}
+
+# -- Output paths -------------------------------------------------------------
+OUTPUT_DIR = Path(__file__).parent / "indeed_jobs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+JSON_FILE  = OUTPUT_DIR / "indeed_68roles_jobs_us.json"
+CSV_FILE   = OUTPUT_DIR / "indeed_68roles_jobs_us.csv"
+STATE_FILE = OUTPUT_DIR / "indeed_68roles_state.json"
+
+# -- Logging ------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("indeed_68roles")
+
+
+# -- Helpers ------------------------------------------------------------------
+
+def sanitize(obj: Any) -> Any:
+    """Recursively make a value JSON/CSV safe."""
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize(v) for v in obj]
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if hasattr(obj, "isoformat"):
+        return obj.isoformat()
+    if isinstance(obj, float) and math.isnan(obj):
+        return None
+    try:
+        if obj is pd.NaT or obj is pd.NA:
+            return None
+    except Exception:
+        pass
+    return obj
+
+
+def make_job_id(title: str, company: str, location: str) -> str:
+    """Stable MD5 dedup key — survives across roles and runs."""
+    key = f"indeed:{title.lower().strip()}:{company.lower().strip()}:{location.lower().strip()}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+
+def clean_num(val: Any) -> Any:
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    return val
+
+
+# -- State management ---------------------------------------------------------
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            log.info(
+                f"Resumed state: {len(state.get('completed_roles', []))} roles done, "
+                f"{state.get('total_jobs', 0)} jobs so far."
+            )
+            return state
+        except json.JSONDecodeError:
+            log.warning("Corrupt state file — starting fresh.")
+    return {"completed_roles": [], "total_jobs": 0, "seen_ids": []}
+
+
+def save_state(state: dict) -> None:
+    """Atomic write: .tmp then rename — never corrupts on crash."""
+    tmp = STATE_FILE.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        tmp.replace(STATE_FILE)
+    except Exception as e:
+        log.warning(f"Could not save state: {e}")
+
+
+# -- Disk I/O -----------------------------------------------------------------
+
+def load_existing_jobs() -> list[dict]:
+    if JSON_FILE.exists() and JSON_FILE.stat().st_size > 0:
+        try:
+            with open(JSON_FILE, "r", encoding="utf-8") as f:
+                jobs = json.load(f)
+            log.info(f"Loaded {len(jobs)} existing jobs from {JSON_FILE.name}")
+            return jobs
+        except json.JSONDecodeError:
+            log.warning("Corrupt JSON — will overwrite.")
+    return []
+
+
+def append_jobs_to_disk(new_jobs: list[dict]) -> None:
+    if not new_jobs:
+        return
+
+    # JSON
+    existing: list[dict] = []
+    if JSON_FILE.exists() and JSON_FILE.stat().st_size > 0:
+        try:
+            with open(JSON_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except json.JSONDecodeError:
+            log.warning("Corrupt JSON on append — overwriting.")
+    existing.extend(new_jobs)
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+
+    # CSV
+    write_header = not CSV_FILE.exists() or CSV_FILE.stat().st_size == 0
+    df = pd.DataFrame(new_jobs)
+    
+    # Add Index_No column to keep it aligned
+    start_idx = len(existing) if 'existing' in locals() else 0
+    df.insert(0, "Index_No", range(start_idx + 1, start_idx + len(df) + 1))
+    
+    df.to_csv(
+        CSV_FILE,
+        mode="a",
+        header=write_header,
+        index=False,
+        quoting=csv.QUOTE_NONNUMERIC,
+        escapechar="\\",
+    )
+
+
+# -- Supabase (optional) ------------------------------------------------------
+
+def upsert_to_supabase(jobs: list[dict]) -> None:
+    if not (SUPABASE_URL and SUPABASE_KEY and HAS_HTTPX and jobs):
+        return
+
+    url = SUPABASE_URL.rstrip("/") + "/rest/v1/jobs"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
+
+    STRIP_FIELDS = {"salary_currency", "also_on"}
+    clean = [{k: v for k, v in j.items() if k not in STRIP_FIELDS} for j in jobs]
+
+    seen: set[str] = set()
+    deduped = []
+    for job in clean:
+        jid = job.get("id", "")
+        if jid and jid not in seen:
+            seen.add(jid)
+            deduped.append(job)
+
+    for i in range(0, len(deduped), 200):
+        chunk = deduped[i : i + 200]
+        try:
+            resp = _httpx.post(url, headers=headers, json=chunk, timeout=30)
+            if resp.status_code in (200, 201):
+                log.info(f"  Supabase: upserted {len(chunk)} jobs")
+            else:
+                log.warning(f"  Supabase {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            log.warning(f"  Supabase upsert failed: {e}")
+
+
+# -- Core: scrape one role ----------------------------------------------------
+
+def scrape_role(
+    role: str,
+    location: str,
+    country: str,
+    hours_old: int | None,
+    global_seen_ids: set[str],
+) -> tuple[list[dict], dict]:
+    """
+    Scrape Indeed for one role title.
+    Returns (job_list, stats)  where stats = {batches, hit_429}
+    """
+    log.info(f"  Role: '{role}'")
+
+    all_jobs: list[dict] = []
+    seen_urls: set[str] = set()
+    offset = 0
+    stats = {"batches": 0, "hit_429": False}
+
+    while offset < MAX_RESULTS_PER_ROLE:
+        # Polite delay between pages
+        if offset > 0:
+            delay = BASE_DELAY_SEC + random.uniform(1.0, 3.0)
+            log.info(f"    Sleeping {delay:.1f}s between pages...")
+            time.sleep(delay)
+
+        batch_df: "pd.DataFrame | None" = None
+        pauses_429 = 0
+        attempt = 0
+
+        # Fetch with retry
+        while attempt < MAX_RETRIES:
+            try:
+                log.info(f"    offset={offset} (attempt {attempt + 1}/{MAX_RETRIES})")
+                kwargs: dict[str, Any] = {
+                    "site_name":      ["indeed"],
+                    "search_term":    role,
+                    "location":       location,
+                    "results_wanted": BATCH_SIZE,
+                    "offset":         offset,
+                    "country_indeed": country,
+                    "verbose":        0,
+                }
+                if hours_old is not None:
+                    kwargs["hours_old"] = hours_old
+
+                batch_df = scrape_jobs(**kwargs)
+                break  # success
+
+            except Exception as exc:
+                err = str(exc).lower()
+
+                if any(t in err for t in ("429", "too many", "rate limit", "ratelimit")):
+                    stats["hit_429"] = True
+                    pauses_429 += 1
+                    if pauses_429 > MAX_429_PAUSES:
+                        log.warning(
+                            f"    Repeated 429s at offset={offset}. "
+                            "Stopping pages for this role."
+                        )
+                        return all_jobs, stats
+                    log.warning(
+                        f"    429 detected — pausing {BACKOFF_429_SEC}s "
+                        f"({pauses_429}/{MAX_429_PAUSES})..."
+                    )
+                    time.sleep(BACKOFF_429_SEC)
+                    # Do NOT increment attempt — 429 pauses are not retries
+
+                else:
+                    attempt += 1
+                    if attempt >= MAX_RETRIES:
+                        log.warning(
+                            f"    offset={offset} failed after {MAX_RETRIES} attempts. Skipping page."
+                        )
+                        break
+                    wait = min(BASE_DELAY_SEC * (2 ** attempt) + random.uniform(0, 2), 300)
+                    log.warning(f"    Error: {exc}. Retrying in {wait:.0f}s...")
+                    time.sleep(wait)
+
+        if batch_df is None or (hasattr(batch_df, "empty") and batch_df.empty):
+            log.info(f"    No more results for '{role}'.")
+            break
+
+        stats["batches"] += 1
+        batch_len = len(batch_df)
+        new_in_batch = 0
+
+        for _, row in batch_df.iterrows():
+            url = str(row.get("job_url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            title   = str(row.get("title",   "") or "").strip()
+            company = str(row.get("company", "") or "").strip()
+            loc     = str(row.get("location","") or "").strip()
+            desc    = str(row.get("description", "") or "")[:5000]
+
+            # Global cross-role dedup
+            job_id = make_job_id(title, company, loc)
+            if job_id in global_seen_ids:
+                continue
+            global_seen_ids.add(job_id)
+
+            # Date normalisation
+            date_posted = row.get("date_posted")
+            if hasattr(date_posted, "isoformat"):
+                date_str: str | None = date_posted.isoformat()
+            elif date_posted:
+                date_str = str(date_posted)
+            else:
+                date_str = None
+
+            raw_job: dict[str, Any] = {
+                "id":              job_id,
+                "search_role":     role,
+                "job_title":       title,
+                "company":         company,
+                "location":        loc,
+                "job_url":         url,
+                "apply_url":       str(row.get("job_url_direct") or url),
+                "description":     desc,
+                "salary_min":      clean_num(row.get("min_amount")),
+                "salary_max":      clean_num(row.get("max_amount")),
+                "salary_currency": str(row.get("currency") or ""),
+                "job_type":        (str(row.get("job_type") or "").lower().replace(" ", "_") or "full_time"),
+                "is_remote":       bool(row.get("is_remote", False)),
+                "source_board":    "Indeed",
+                "scraper_type":    "jobspy",
+                "created_at":      date_str,
+                "scraped_at":      datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            try:
+                job = enrich_raw_job(raw_job)
+            except Exception:
+                job = raw_job
+
+            all_jobs.append(sanitize(job))
+            new_in_batch += 1
+
+        log.info(
+            f"    Page {offset // BATCH_SIZE + 1}: "
+            f"{new_in_batch} new / {batch_len} returned "
+            f"(role running total: {len(all_jobs)})"
+        )
+
+        # Short page = last page
+        if batch_len < BATCH_SIZE:
+            log.info(f"    Short page ({batch_len} < {BATCH_SIZE}) — last page.")
+            break
+
+        offset += BATCH_SIZE
+
+    return all_jobs, stats
+
+
+# -- Main pipeline ------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Indeed 68-Roles Scraper — procurement/sourcing/buying jobs"
+    )
+    parser.add_argument(
+        "--post-time",
+        choices=list(POST_TIME_MAP.keys()),
+        default="week",
+        help="How recent jobs must be (default: week = last 7 days)",
+    )
+    parser.add_argument("--location", default="USA",
+                        help="Search location (default: USA)")
+    parser.add_argument("--country",  default="usa",
+                        help="Indeed country code (default: usa)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from last saved state")
+    parser.add_argument("--role", type=str, default=None,
+                        help="Scrape only one role (case-insensitive substring match)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit the number of roles to run (e.g., 30 for the first 30 roles)")
+    parser.add_argument("--start-idx", type=int, default=1,
+                        help="Start role index (1-based, inclusive)")
+    parser.add_argument("--end-idx", type=int, default=None,
+                        help="End role index (1-based, inclusive)")
+    parser.add_argument(
+        "--hours",
+        type=int,
+        default=None,
+        help="Explicit max hours old (overrides --post-time, e.g. 504 for 3 weeks)",
+    )
+    parser.add_argument("--use-supabase", action="store_true",
+                        help="Enable Supabase upsert if credentials are set (disabled by default)")
+    args = parser.parse_args()
+
+    hours_old    = args.hours if args.hours is not None else POST_TIME_MAP.get(args.post_time)
+    use_supabase = args.use_supabase
+
+    log.info("=" * 65)
+    log.info("INDEED 68-ROLES SCRAPER")
+    log.info(f"  Roles      : {len(ROLES)}")
+    log.info(f"  Post-time  : {args.post_time}" + (f" ({hours_old}h)" if hours_old else " (any time)"))
+    log.info(f"  Location   : {args.location}")
+    log.info(f"  Country    : {args.country}")
+    log.info(f"  Output     : {JSON_FILE}")
+    log.info(f"  Supabase   : {'enabled' if (use_supabase and SUPABASE_URL and SUPABASE_KEY) else 'disabled'}")
+    log.info("=" * 65)
+
+    # Load / init state
+    state = load_state() if args.resume else {"completed_roles": [], "total_jobs": 0, "seen_ids": []}
+
+    completed:       set[str] = set(state.get("completed_roles", []))
+    grand_total:     int      = state.get("total_jobs", 0)
+    global_seen_ids: set[str] = set(state.get("seen_ids", []))
+
+    # Always pull IDs from any existing output file to prevent redundancies
+    for job in load_existing_jobs():
+        if job.get("id"):
+            global_seen_ids.add(job["id"])
+
+    # Role filter
+    roles_to_run = ROLES
+    if args.role:
+        roles_to_run = [r for r in ROLES if args.role.lower() in r.lower()]
+        if not roles_to_run:
+            log.error(f"No role matching '{args.role}' in the 68-role list.")
+            return
+        log.info(f"  Filtered to {len(roles_to_run)} role(s) by name: {roles_to_run}")
+
+    if args.limit:
+        roles_to_run = roles_to_run[:args.limit]
+        log.info(f"  Limited to first {args.limit} roles.")
+        
+    if args.start_idx > 1 or args.end_idx is not None:
+        start_index = max(0, args.start_idx - 1)
+        end_index = args.end_idx if args.end_idx is not None else len(roles_to_run)
+        roles_to_run = roles_to_run[start_index:end_index]
+        log.info(f"  Limited to roles {start_index + 1} through {end_index}.")
+
+    run_jobs:      list[dict] = []
+    hot_remaining: int        = 0
+    prev_was_heavy: bool      = False
+    scraped_any:   bool       = False
+
+    # Main loop
+    for idx, role in enumerate(roles_to_run, start=1):
+        if role in completed:
+            log.info(f"[{idx:>2}/{len(roles_to_run)}] '{role}' — already completed, skipping")
+            continue
+
+        log.info(f"\n[{idx:>2}/{len(roles_to_run)}] -- {role} " + "-" * max(1, 48 - len(role)))
+
+        # Inter-role cooldown
+        if scraped_any:
+            if hot_remaining > 0 or prev_was_heavy:
+                cooldown = random.uniform(HOT_COOLDOWN_MIN, HOT_COOLDOWN_MAX)
+                hot_remaining = max(0, hot_remaining - 1)
+                log.info(f"  [HOT cooldown] Sleeping {cooldown:.0f}s...")
+            else:
+                cooldown = random.uniform(ROLE_COOLDOWN_MIN, ROLE_COOLDOWN_MAX)
+                log.info(f"  Sleeping {cooldown:.0f}s before next role...")
+            time.sleep(cooldown)
+
+        try:
+            jobs, stats = scrape_role(
+                role=role,
+                location=args.location,
+                country=args.country,
+                hours_old=hours_old,
+                global_seen_ids=global_seen_ids,
+            )
+        except KeyboardInterrupt:
+            log.warning("\nInterrupted — saving state...")
+            _flush(state, completed, grand_total, global_seen_ids, run_jobs, use_supabase)
+            return
+        except Exception as exc:
+            log.error(f"Unexpected error on '{role}': {exc}", exc_info=True)
+            jobs, stats = [], {"batches": 0, "hit_429": False}
+
+        scraped_any    = True
+        prev_was_heavy = stats["batches"] > 1
+        if stats["hit_429"]:
+            hot_remaining = HOT_STREAK_ROLES
+            log.warning(f"  429 seen — hot cooldowns for next {HOT_STREAK_ROLES} roles.")
+
+        if jobs:
+            log.info(f"  Found {len(jobs)} new jobs for '{role}'")
+            run_jobs.extend(jobs)
+            grand_total += len(jobs)
+            append_jobs_to_disk(jobs)
+            if use_supabase:
+                upsert_to_supabase(jobs)
+        else:
+            log.info(f"  No new jobs for '{role}'")
+
+        completed.add(role)
+        state["completed_roles"] = list(completed)
+        state["total_jobs"]      = grand_total
+        state["seen_ids"]        = list(global_seen_ids)
+        save_state(state)
+
+    log.info("\n" + "=" * 65)
+    log.info("SCRAPER COMPLETE")
+    log.info(f"  Roles processed : {len(completed)}")
+    log.info(f"  New jobs (run)  : {len(run_jobs)}")
+    log.info(f"  Total jobs      : {grand_total}")
+    log.info(f"  JSON            : {JSON_FILE}")
+    log.info(f"  CSV             : {CSV_FILE}")
+    log.info("=" * 65)
+
+
+def _flush(
+    state: dict,
+    completed: set[str],
+    grand_total: int,
+    seen_ids: set[str],
+    run_jobs: list[dict],
+    use_supabase: bool,
+) -> None:
+    """Flush everything on KeyboardInterrupt."""
+    if run_jobs:
+        append_jobs_to_disk(run_jobs)
+        if use_supabase:
+            upsert_to_supabase(run_jobs)
+    state["completed_roles"] = list(completed)
+    state["total_jobs"]      = grand_total
+    state["seen_ids"]        = list(seen_ids)
+    save_state(state)
+    log.info(f"State saved. Resume with: python3 {Path(__file__).name} --resume")
+
+
+if __name__ == "__main__":
+    main()
