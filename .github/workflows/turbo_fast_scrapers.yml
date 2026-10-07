@@ -184,78 +184,89 @@ jobs:
                       row['Index_No'] = idx
                       writer.writerow(row)
 
+          def read_shard(filepath):
+              results = []
+              if filepath.endswith('.json'):
+                  with open(filepath, 'r', encoding='utf-8') as f:
+                      return json.load(f)
+              elif filepath.endswith('.csv'):
+                  with open(filepath, 'r', encoding='utf-8') as f:
+                      return list(csv.DictReader(f))
+              return results
+
           # 1. Merge LinkedIn shards
-          li_files = sorted(glob.glob('scraped_shards/**/linkedin_shard_*_jobs.json', recursive=True))
+          li_files = sorted(glob.glob('scraped_shards/**/linkedin_shard_*_jobs.*', recursive=True))
           li_jobs = []
           seen_li = set()
           for f in li_files:
               try:
-                  with open(f, 'r', encoding='utf-8') as fh:
-                      data = json.load(fh)
-                      for j in data:
-                          jid = j.get('id') or (j.get('title','')+j.get('company','')+j.get('location',''))
-                          if jid not in seen_li:
-                              seen_li.add(jid)
-                              li_jobs.append(j)
+                  data = read_shard(f)
+                  for j in data:
+                      jid = j.get('id') or (j.get('title','')+j.get('company','')+j.get('location',''))
+                      if jid not in seen_li:
+                          seen_li.add(jid)
+                          li_jobs.append(j)
               except Exception as e:
                   print(f'Error reading {f}: {e}')
 
           if li_jobs:
               os.makedirs('linkedin/linkedin_jobs', exist_ok=True)
-              with open('linkedin/linkedin_jobs/linkedin_68roles_jobs_us.json', 'w', encoding='utf-8') as fh:
-                  json.dump(li_jobs, fh, indent=2, ensure_ascii=False)
+              # Master CSV (all 68 roles)
               write_csv(li_jobs, 'linkedin/linkedin_jobs/linkedin_68roles_jobs_us.csv')
               
-              # Strict export
+              # Strict matching CSV
               li_strict = [j for j in li_jobs if strict_pattern.search(str(j.get('job_title', '')))]
               write_csv(li_strict, 'linkedin/linkedin_jobs/linkedin_68roles_jobs_us_strict.csv')
-              with open('linkedin/linkedin_jobs/linkedin_68roles_jobs_us_strict.json', 'w', encoding='utf-8') as fh:
-                  json.dump(li_strict, fh, indent=2, ensure_ascii=False)
-              print(f'LinkedIn: {len(li_files)} shards -> {len(li_jobs)} total jobs ({len(li_strict)} strict)')
+              print(f'LinkedIn: {len(li_jobs)} total jobs, {len(li_strict)} strict jobs.')
           else:
               print('No LinkedIn shard files found.')
 
           # 2. Merge Indeed shards
-          ind_files = sorted(glob.glob('scraped_shards/**/indeed_shard_*_jobs.json', recursive=True))
+          ind_files = sorted(glob.glob('scraped_shards/**/indeed_shard_*_jobs.*', recursive=True))
           ind_jobs = []
           seen_ind = set()
           for f in ind_files:
               try:
-                  with open(f, 'r', encoding='utf-8') as fh:
-                      data = json.load(fh)
-                      for j in data:
-                          jid = j.get('id') or (j.get('title','')+j.get('company','')+j.get('location',''))
-                          if jid not in seen_ind:
-                              seen_ind.add(jid)
-                              ind_jobs.append(j)
+                  data = read_shard(f)
+                  for j in data:
+                      jid = j.get('id') or (j.get('title','')+j.get('company','')+j.get('location',''))
+                      if jid not in seen_ind:
+                          seen_ind.add(jid)
+                          ind_jobs.append(j)
               except Exception as e:
                   print(f'Error reading {f}: {e}')
 
           if ind_jobs:
               os.makedirs('indeed/indeed_jobs', exist_ok=True)
-              with open('indeed/indeed_jobs/indeed_68roles_jobs_us.json', 'w', encoding='utf-8') as fh:
-                  json.dump(ind_jobs, fh, indent=2, ensure_ascii=False)
+              # Master CSV (all 68 roles)
               write_csv(ind_jobs, 'indeed/indeed_jobs/indeed_68roles_jobs_us.csv')
               
-              # Strict export
+              # Strict matching CSV
               ind_strict = [j for j in ind_jobs if strict_pattern.search(str(j.get('job_title', '')))]
               write_csv(ind_strict, 'indeed/indeed_jobs/indeed_68roles_jobs_us_strict.csv')
-              with open('indeed/indeed_jobs/indeed_68roles_jobs_us_strict.json', 'w', encoding='utf-8') as fh:
-                  json.dump(ind_strict, fh, indent=2, ensure_ascii=False)
-              print(f'Indeed: {len(ind_files)} shards -> {len(ind_jobs)} total jobs ({len(ind_strict)} strict)')
+              print(f'Indeed: {len(ind_jobs)} total jobs, {len(ind_strict)} strict jobs.')
           else:
               print('No Indeed shard files found.')
+
+          # Clean up any non-CSV / unnecessary files from output dirs
+          for directory, prefix in [('linkedin/linkedin_jobs', 'linkedin'), ('indeed/indeed_jobs', 'indeed')]:
+              if os.path.exists(directory):
+                  for fname in os.listdir(directory):
+                      if fname not in [f'{prefix}_68roles_jobs_us.csv', f'{prefix}_68roles_jobs_us_strict.csv']:
+                          fpath = os.path.join(directory, fname)
+                          if os.path.isfile(fpath):
+                              os.remove(fpath)
           "
           rm -rf scraped_shards
 
-      - name: Upload Merged Master Datasets Artifact
+      - name: Upload Merged Master CSVs Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: master-merged-datasets
+          name: master-merged-csvs
           path: |
-            linkedin/linkedin_jobs/linkedin_68roles_jobs_us.*
-            indeed/indeed_jobs/indeed_68roles_jobs_us.*
+            linkedin/linkedin_jobs/*.csv
+            indeed/indeed_jobs/*.csv
           if-no-files-found: warn
 
       - name: Commit and push combined datasets
@@ -263,6 +274,6 @@ jobs:
         continue-on-error: true
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "⚡ Turbo Scrape — Full Descriptions + All Jobs (32x Parallel) 🤖"
-          file_pattern: 'linkedin/linkedin_jobs/* indeed/indeed_jobs/*'
+          commit_message: "⚡ Turbo Scrape — 2 Master CSVs (All Roles & Strict Matching) 🤖"
+          file_pattern: 'linkedin/linkedin_jobs/*.csv indeed/indeed_jobs/*.csv'
           commit_author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>

@@ -197,11 +197,9 @@ POST_TIME_MAP: dict[str, int | None] = {
 OUTPUT_DIR = Path(__file__).parent / "indeed_jobs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-JSON_FILE        = OUTPUT_DIR / "indeed_68roles_jobs_us.json"
 CSV_FILE         = OUTPUT_DIR / "indeed_68roles_jobs_us.csv"
-JSON_STRICT_FILE = OUTPUT_DIR / "indeed_68roles_jobs_us_strict.json"
 CSV_STRICT_FILE  = OUTPUT_DIR / "indeed_68roles_jobs_us_strict.csv"
-STATE_FILE       = OUTPUT_DIR / "indeed_68roles_state.json"
+STATE_FILE       = OUTPUT_DIR / ".indeed_68roles_state.json"
 
 # -- Logging ------------------------------------------------------------------
 logging.basicConfig(
@@ -277,14 +275,15 @@ def save_state(state: dict) -> None:
 # -- Disk I/O -----------------------------------------------------------------
 
 def load_existing_jobs() -> list[dict]:
-    if JSON_FILE.exists() and JSON_FILE.stat().st_size > 0:
+    if CSV_FILE.exists() and CSV_FILE.stat().st_size > 0:
         try:
-            with open(JSON_FILE, "r", encoding="utf-8") as f:
-                jobs = json.load(f)
-            log.info(f"Loaded {len(jobs)} existing jobs from {JSON_FILE.name}")
+            with open(CSV_FILE, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                jobs = list(reader)
+            log.info(f"Loaded {len(jobs)} existing jobs from {CSV_FILE.name}")
             return jobs
-        except json.JSONDecodeError:
-            log.warning("Corrupt JSON — will overwrite.")
+        except Exception as e:
+            log.warning(f"Could not load existing CSV: {e}")
     return []
 
 
@@ -292,55 +291,63 @@ def append_jobs_to_disk(new_jobs: list[dict]) -> None:
     if not new_jobs:
         return
 
-    # JSON
-    existing: list[dict] = []
-    if JSON_FILE.exists() and JSON_FILE.stat().st_size > 0:
-        try:
-            with open(JSON_FILE, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        except json.JSONDecodeError:
-            log.warning("Corrupt JSON on append — overwriting.")
-    existing.extend(new_jobs)
-    with open(JSON_FILE, "w", encoding="utf-8") as f:
-        json.dump(existing, f, indent=2, ensure_ascii=False)
-
-    # CSV
     write_header = not CSV_FILE.exists() or CSV_FILE.stat().st_size == 0
-    df = pd.DataFrame(new_jobs)
-    
-    # Add Index_No column to keep it aligned
-    start_idx = len(existing) if 'existing' in locals() else 0
-    df.insert(0, "Index_No", range(start_idx + 1, start_idx + len(df) + 1))
-    
-    df.to_csv(
-        CSV_FILE,
-        mode="a",
-        header=write_header,
-        index=False,
-        quoting=csv.QUOTE_NONNUMERIC,
-        escapechar="\\",
-    )
+    start_idx = 0
+    if not write_header:
+        try:
+            with open(CSV_FILE, "r", encoding="utf-8") as f:
+                start_idx = max(0, sum(1 for _ in f) - 1)
+        except Exception:
+            start_idx = 0
+
+    fieldnames = list(new_jobs[0].keys())
+    if "Index_No" not in fieldnames:
+        fieldnames = ["Index_No"] + fieldnames
+
+    with open(CSV_FILE, "a", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=fieldnames,
+            quoting=csv.QUOTE_NONNUMERIC,
+            escapechar="\\",
+        )
+        if write_header:
+            writer.writeheader()
+        for idx, job in enumerate(new_jobs, start=start_idx + 1):
+            row = dict(job)
+            row["Index_No"] = idx
+            writer.writerow(row)
 
 
 def export_strict_datasets() -> None:
-    """Filter master dataset to only jobs where job_title strictly matches target role titles."""
+    """Filter master CSV to only jobs where job_title strictly matches target role titles."""
     try:
         if not CSV_FILE.exists() or CSV_FILE.stat().st_size == 0:
             return
-        df = pd.read_csv(CSV_FILE, escapechar="\\", low_memory=False)
         roles_sorted = sorted([r.lower() for r in ROLES], key=len, reverse=True)
         pattern = re.compile(r'\b(' + '|'.join(re.escape(r) for r in roles_sorted) + r')\b', re.IGNORECASE)
-        df_strict = df[df['job_title'].astype(str).apply(lambda t: bool(pattern.search(t)))].copy()
-        df_strict['Index_No'] = range(1, len(df_strict) + 1)
-        df_strict.to_csv(CSV_STRICT_FILE, index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
 
-        if JSON_FILE.exists() and JSON_FILE.stat().st_size > 0:
-            with open(JSON_FILE, "r", encoding="utf-8") as f:
-                jobs = json.load(f)
-            strict_jobs = [j for j in jobs if pattern.search(str(j.get("job_title", "")))]
-            with open(JSON_STRICT_FILE, "w", encoding="utf-8") as f:
-                json.dump(strict_jobs, f, indent=2, ensure_ascii=False)
-        log.info(f"Strict dataset updated: {len(df_strict)} jobs saved to {CSV_STRICT_FILE.name}")
+        with open(CSV_FILE, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            strict_jobs = []
+            for row in reader:
+                if pattern.search(str(row.get("job_title", ""))):
+                    strict_jobs.append(row)
+
+        with open(CSV_STRICT_FILE, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames,
+                quoting=csv.QUOTE_NONNUMERIC,
+                escapechar="\\",
+            )
+            writer.writeheader()
+            for idx, row in enumerate(strict_jobs, start=1):
+                row["Index_No"] = idx
+                writer.writerow(row)
+
+        log.info(f"Strict dataset updated: {len(strict_jobs)} jobs saved to {CSV_STRICT_FILE.name}")
     except Exception as e:
         log.warning(f"Could not export strict dataset: {e}")
 
@@ -684,14 +691,12 @@ def main() -> None:
                         help="Enable Supabase upsert if credentials are set (disabled by default)")
     args = parser.parse_args()
 
-    global JSON_FILE, CSV_FILE, STATE_FILE, JSON_STRICT_FILE, CSV_STRICT_FILE
+    global CSV_FILE, STATE_FILE, CSV_STRICT_FILE
     if args.shard:
         shard_label = args.shard.replace("/", "-")
-        JSON_FILE        = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs.json"
         CSV_FILE         = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs.csv"
-        JSON_STRICT_FILE = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs_strict.json"
         CSV_STRICT_FILE  = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs_strict.csv"
-        STATE_FILE       = OUTPUT_DIR / f"indeed_shard_{shard_label}_state.json"
+        STATE_FILE       = OUTPUT_DIR / f".indeed_shard_{shard_label}_state.json"
 
     hours_old    = args.hours if args.hours is not None else POST_TIME_MAP.get(args.post_time)
     use_supabase = args.use_supabase
@@ -714,7 +719,8 @@ def main() -> None:
     log.info(f"  Post-time  : {args.post_time}" + (f" ({hours_old}h)" if hours_old else " (any time)"))
     log.info(f"  Location   : {args.location}")
     log.info(f"  Country    : {args.country}")
-    log.info(f"  Output     : {JSON_FILE}")
+    log.info(f"  Output CSV : {CSV_FILE}")
+    log.info(f"  Strict CSV : {CSV_STRICT_FILE}")
     log.info(f"  Supabase   : {'enabled' if (use_supabase and SUPABASE_URL and SUPABASE_KEY) else 'disabled'}")
     log.info("=" * 65)
 
@@ -819,14 +825,20 @@ def main() -> None:
 
     export_strict_datasets()
 
+    # Clean up state file on complete run so only the 2 CSV files remain
+    if not args.shard and STATE_FILE.exists():
+        try:
+            STATE_FILE.unlink()
+        except Exception:
+            pass
+
     log.info("\n" + "=" * 65)
-    log.info("SCRAPER COMPLETE")
-    log.info(f"  Roles processed : {len(completed)}")
-    log.info(f"  New jobs (run)  : {len(run_jobs)}")
-    log.info(f"  Total jobs      : {grand_total}")
-    log.info(f"  JSON            : {JSON_FILE}")
-    log.info(f"  CSV             : {CSV_FILE}")
-    log.info(f"  Strict CSV      : {CSV_STRICT_FILE}")
+    log.info("SCRAPER COMPLETE — 2 Master Files Generated:")
+    log.info(f"  Roles processed   : {len(completed)}")
+    log.info(f"  New jobs (run)    : {len(run_jobs)}")
+    log.info(f"  Total jobs        : {grand_total}")
+    log.info(f"  1. Master CSV     : {CSV_FILE}")
+    log.info(f"  2. Strict CSV     : {CSV_STRICT_FILE}")
     log.info("=" * 65)
 
 
