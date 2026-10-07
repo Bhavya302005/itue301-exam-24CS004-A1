@@ -1,4 +1,4 @@
-name: ⚡ Turbo Fast Scraper (16x Parallel - LinkedIn & Indeed)
+name: ⚡ Turbo Fast Scraper (32x Parallel + Full Descriptions)
 
 on:
   workflow_dispatch:
@@ -16,19 +16,20 @@ on:
           - 'day'
           - 'any'
       max_results:
-        description: 'Max jobs per role ("all" fetches all available jobs until exhausted)'
+        description: 'Max jobs per role ("all" = every available job — recommended)'
         required: true
         default: 'all'
         type: choice
         options:
           - 'all'
+          - '500'
           - '200'
           - '100'
           - '50'
       fetch_descriptions:
-        description: 'Fetch Full Descriptions (Leave false for 5x faster LinkedIn)'
+        description: 'Fetch Full Descriptions (32-thread parallel — recommended ON)'
         required: true
-        default: false
+        default: true
         type: boolean
       boards:
         description: 'Which boards to scrape'
@@ -47,7 +48,23 @@ jobs:
       fail-fast: false
       matrix:
         board: [linkedin, indeed]
-        shard: ["1/8", "2/8", "3/8", "4/8", "5/8", "6/8", "7/8", "8/8"]
+        shard:
+          - "1/16"
+          - "2/16"
+          - "3/16"
+          - "4/16"
+          - "5/16"
+          - "6/16"
+          - "7/16"
+          - "8/16"
+          - "9/16"
+          - "10/16"
+          - "11/16"
+          - "12/16"
+          - "13/16"
+          - "14/16"
+          - "15/16"
+          - "16/16"
 
     steps:
       - name: Checkout repository
@@ -76,19 +93,26 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install python-jobspy pandas python-dotenv openpyxl
+          # httpx is required for 32-thread parallel description fetching
+          pip install python-jobspy pandas python-dotenv openpyxl httpx
 
       - name: Scrape LinkedIn Shard ${{ matrix.shard }}
         if: steps.check.outputs.run == 'true' && matrix.board == 'linkedin'
-        timeout-minutes: 180
+        timeout-minutes: 300
         run: |
           POST_TIME="${{ github.event.inputs.post_time || '3week' }}"
           MAX_RES="${{ github.event.inputs.max_results || 'all' }}"
-          DESC_FLAG="--no-descriptions"
-          if [ "${{ github.event.inputs.fetch_descriptions }}" = "true" ]; then
-            DESC_FLAG=""
+          # Descriptions enabled by default; pass --no-descriptions only if explicitly disabled
+          DESC_FLAG=""
+          if [ "${{ github.event.inputs.fetch_descriptions }}" = "false" ]; then
+            DESC_FLAG="--no-descriptions"
           fi
-          python linkedin/linkedin_68_roles.py --post-time "$POST_TIME" --shard "${{ matrix.shard }}" --fast --max-results "$MAX_RES" $DESC_FLAG
+          python linkedin/linkedin_68_roles.py \
+            --post-time "$POST_TIME" \
+            --shard "${{ matrix.shard }}" \
+            --fast \
+            --max-results "$MAX_RES" \
+            $DESC_FLAG
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -96,11 +120,15 @@ jobs:
 
       - name: Scrape Indeed Shard ${{ matrix.shard }}
         if: steps.check.outputs.run == 'true' && matrix.board == 'indeed'
-        timeout-minutes: 180
+        timeout-minutes: 300
         run: |
           POST_TIME="${{ github.event.inputs.post_time || '3week' }}"
           MAX_RES="${{ github.event.inputs.max_results || 'all' }}"
-          python indeed/indeed_68_roles.py --post-time "$POST_TIME" --shard "${{ matrix.shard }}" --fast --max-results "$MAX_RES"
+          python indeed/indeed_68_roles.py \
+            --post-time "$POST_TIME" \
+            --shard "${{ matrix.shard }}" \
+            --fast \
+            --max-results "$MAX_RES"
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -124,6 +152,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all job artifacts
         uses: actions/download-artifact@v4
@@ -133,8 +163,26 @@ jobs:
       - name: Merge all shards into master datasets
         run: |
           python3 -c "
-          import json, glob, os
-          import pandas as pd
+          import json, glob, os, re, csv
+          from pathlib import Path
+          from indeed.indeed_68_roles import ROLES
+
+          roles_sorted = sorted([r.lower() for r in ROLES], key=len, reverse=True)
+          strict_pattern = re.compile(r'\b(' + '|'.join(re.escape(r) for r in roles_sorted) + r')\b', re.IGNORECASE)
+
+          def write_csv(items, path):
+              if not items:
+                  return
+              fieldnames = list(items[0].keys())
+              if 'Index_No' not in fieldnames:
+                  fieldnames = ['Index_No'] + fieldnames
+              with open(path, 'w', encoding='utf-8', newline='') as fp:
+                  writer = csv.DictWriter(fp, fieldnames=fieldnames, quoting=csv.QUOTE_NONNUMERIC, escapechar='\\\\')
+                  writer.writeheader()
+                  for idx, item in enumerate(items, start=1):
+                      row = dict(item)
+                      row['Index_No'] = idx
+                      writer.writerow(row)
 
           # 1. Merge LinkedIn shards
           li_files = sorted(glob.glob('scraped_shards/**/linkedin_shard_*_jobs.json', recursive=True))
@@ -151,13 +199,21 @@ jobs:
                               li_jobs.append(j)
               except Exception as e:
                   print(f'Error reading {f}: {e}')
-          
+
           if li_jobs:
               os.makedirs('linkedin/linkedin_jobs', exist_ok=True)
               with open('linkedin/linkedin_jobs/linkedin_68roles_jobs_us.json', 'w', encoding='utf-8') as fh:
                   json.dump(li_jobs, fh, indent=2, ensure_ascii=False)
-              pd.DataFrame(li_jobs).to_csv('linkedin/linkedin_jobs/linkedin_68roles_jobs_us.csv', index=False)
-              print(f'✅ Merged {len(li_files)} LinkedIn shards -> {len(li_jobs)} total jobs')
+              write_csv(li_jobs, 'linkedin/linkedin_jobs/linkedin_68roles_jobs_us.csv')
+              
+              # Strict export
+              li_strict = [j for j in li_jobs if strict_pattern.search(str(j.get('job_title', '')))]
+              write_csv(li_strict, 'linkedin/linkedin_jobs/linkedin_68roles_jobs_us_strict.csv')
+              with open('linkedin/linkedin_jobs/linkedin_68roles_jobs_us_strict.json', 'w', encoding='utf-8') as fh:
+                  json.dump(li_strict, fh, indent=2, ensure_ascii=False)
+              print(f'LinkedIn: {len(li_files)} shards -> {len(li_jobs)} total jobs ({len(li_strict)} strict)')
+          else:
+              print('No LinkedIn shard files found.')
 
           # 2. Merge Indeed shards
           ind_files = sorted(glob.glob('scraped_shards/**/indeed_shard_*_jobs.json', recursive=True))
@@ -179,14 +235,34 @@ jobs:
               os.makedirs('indeed/indeed_jobs', exist_ok=True)
               with open('indeed/indeed_jobs/indeed_68roles_jobs_us.json', 'w', encoding='utf-8') as fh:
                   json.dump(ind_jobs, fh, indent=2, ensure_ascii=False)
-              pd.DataFrame(ind_jobs).to_csv('indeed/indeed_jobs/indeed_68roles_jobs_us.csv', index=False)
-              print(f'✅ Merged {len(ind_files)} Indeed shards -> {len(ind_jobs)} total jobs')
+              write_csv(ind_jobs, 'indeed/indeed_jobs/indeed_68roles_jobs_us.csv')
+              
+              # Strict export
+              ind_strict = [j for j in ind_jobs if strict_pattern.search(str(j.get('job_title', '')))]
+              write_csv(ind_strict, 'indeed/indeed_jobs/indeed_68roles_jobs_us_strict.csv')
+              with open('indeed/indeed_jobs/indeed_68roles_jobs_us_strict.json', 'w', encoding='utf-8') as fh:
+                  json.dump(ind_strict, fh, indent=2, ensure_ascii=False)
+              print(f'Indeed: {len(ind_files)} shards -> {len(ind_jobs)} total jobs ({len(ind_strict)} strict)')
+          else:
+              print('No Indeed shard files found.')
           "
           rm -rf scraped_shards
 
+      - name: Upload Merged Master Datasets Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: master-merged-datasets
+          path: |
+            linkedin/linkedin_jobs/linkedin_68roles_jobs_us.*
+            indeed/indeed_jobs/indeed_68roles_jobs_us.*
+          if-no-files-found: warn
+
       - name: Commit and push combined datasets
+        id: commit
+        continue-on-error: true
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "⚡ Automated Turbo Scrape update (LinkedIn & Indeed 16x Parallel) 🤖"
+          commit_message: "⚡ Turbo Scrape — Full Descriptions + All Jobs (32x Parallel) 🤖"
           file_pattern: 'linkedin/linkedin_jobs/* indeed/indeed_jobs/*'
           commit_author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>

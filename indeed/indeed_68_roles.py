@@ -49,6 +49,8 @@ import random
 import hashlib
 import logging
 import argparse
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Any
@@ -163,7 +165,7 @@ ROLES: list[str] = [
 
 # -- Rate-limit / retry tuning ------------------------------------------------
 BATCH_SIZE           = 50     # jobs per Indeed API call
-MAX_RESULTS_PER_ROLE = 1000   # Indeed's hard cap per query
+MAX_RESULTS_PER_ROLE = 999999 # effectively unlimited; pagination ends on short page
 MAX_RETRIES          = 5      # non-429 retries per batch
 MAX_429_PAUSES       = 3      # 429-specific pauses before giving up on a batch
 BASE_DELAY_SEC       = 4      # baseline sleep between pages (seconds)
@@ -173,6 +175,11 @@ HOT_COOLDOWN_MIN     = 60     # min sleep after a 429 event
 HOT_COOLDOWN_MAX     = 90     # max sleep after a 429 event
 HOT_STREAK_ROLES     = 3      # roles to stay on hot cooldown after a 429
 BACKOFF_429_SEC      = 300    # hard 5-min pause on 429 detection
+
+# -- Parallel description fetching --------------------------------------------
+DESC_WORKERS         = 32     # concurrent threads for description fetching
+DESC_TIMEOUT         = 15     # seconds per description request
+DESC_RETRIES         = 2      # retries per failed description fetch
 
 # -- Post-time mapping --------------------------------------------------------
 POST_TIME_MAP: dict[str, int | None] = {
@@ -190,9 +197,11 @@ POST_TIME_MAP: dict[str, int | None] = {
 OUTPUT_DIR = Path(__file__).parent / "indeed_jobs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-JSON_FILE  = OUTPUT_DIR / "indeed_68roles_jobs_us.json"
-CSV_FILE   = OUTPUT_DIR / "indeed_68roles_jobs_us.csv"
-STATE_FILE = OUTPUT_DIR / "indeed_68roles_state.json"
+JSON_FILE        = OUTPUT_DIR / "indeed_68roles_jobs_us.json"
+CSV_FILE         = OUTPUT_DIR / "indeed_68roles_jobs_us.csv"
+JSON_STRICT_FILE = OUTPUT_DIR / "indeed_68roles_jobs_us_strict.json"
+CSV_STRICT_FILE  = OUTPUT_DIR / "indeed_68roles_jobs_us_strict.csv"
+STATE_FILE       = OUTPUT_DIR / "indeed_68roles_state.json"
 
 # -- Logging ------------------------------------------------------------------
 logging.basicConfig(
@@ -313,6 +322,111 @@ def append_jobs_to_disk(new_jobs: list[dict]) -> None:
     )
 
 
+def export_strict_datasets() -> None:
+    """Filter master dataset to only jobs where job_title strictly matches target role titles."""
+    try:
+        if not CSV_FILE.exists() or CSV_FILE.stat().st_size == 0:
+            return
+        df = pd.read_csv(CSV_FILE, escapechar="\\", low_memory=False)
+        roles_sorted = sorted([r.lower() for r in ROLES], key=len, reverse=True)
+        pattern = re.compile(r'\b(' + '|'.join(re.escape(r) for r in roles_sorted) + r')\b', re.IGNORECASE)
+        df_strict = df[df['job_title'].astype(str).apply(lambda t: bool(pattern.search(t)))].copy()
+        df_strict['Index_No'] = range(1, len(df_strict) + 1)
+        df_strict.to_csv(CSV_STRICT_FILE, index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
+
+        if JSON_FILE.exists() and JSON_FILE.stat().st_size > 0:
+            with open(JSON_FILE, "r", encoding="utf-8") as f:
+                jobs = json.load(f)
+            strict_jobs = [j for j in jobs if pattern.search(str(j.get("job_title", "")))]
+            with open(JSON_STRICT_FILE, "w", encoding="utf-8") as f:
+                json.dump(strict_jobs, f, indent=2, ensure_ascii=False)
+        log.info(f"Strict dataset updated: {len(df_strict)} jobs saved to {CSV_STRICT_FILE.name}")
+    except Exception as e:
+        log.warning(f"Could not export strict dataset: {e}")
+
+
+# -- Parallel description fetching -------------------------------------------
+
+def _fetch_indeed_description(url: str) -> str:
+    """
+    Fetch full job description from an Indeed job URL.
+    Returns empty string on failure.
+    """
+    try:
+        import httpx
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        for attempt in range(DESC_RETRIES + 1):
+            try:
+                resp = httpx.get(url, headers=headers, timeout=DESC_TIMEOUT, follow_redirects=True)
+                if resp.status_code == 200:
+                    text = resp.text
+                    # Indeed's description is typically in a jobsearch-jobdescription-theme div
+                    patterns = [
+                        r'<div[^>]*id="jobDescriptionText"[^>]*>(.*?)</div>',
+                        r'<div[^>]*class="[^"]*jobsearch-jobDescriptionText[^"]*"[^>]*>(.*?)</div>',
+                        r'<section[^>]*class="[^"]*jobDescription[^"]*"[^>]*>(.*?)</section>',
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+                        if match:
+                            raw = match.group(1)
+                            clean = re.sub(r'<[^>]+>', ' ', raw)
+                            clean = re.sub(r'\s+', ' ', clean).strip()
+                            if len(clean) > 100:
+                                return clean[:8000]
+                elif resp.status_code == 429:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+            except Exception:
+                if attempt < DESC_RETRIES:
+                    time.sleep(2)
+    except ImportError:
+        pass
+    return ""
+
+
+def async_fetch_descriptions(
+    jobs: list[dict],
+    workers: int = DESC_WORKERS,
+) -> list[dict]:
+    """
+    Fetch descriptions for jobs with empty/short descriptions in parallel.
+    """
+    to_fetch = [
+        (i, j) for i, j in enumerate(jobs)
+        if not j.get("description") or len(str(j.get("description", ""))) < 200
+    ]
+    if not to_fetch:
+        return jobs
+
+    log.info(f"    Fetching descriptions for {len(to_fetch)} jobs via {workers} threads...")
+    fetched = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_idx = {
+            pool.submit(_fetch_indeed_description, j["job_url"]): i
+            for i, j in to_fetch
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                desc = future.result()
+                if desc:
+                    jobs[idx]["description"] = desc
+                    fetched += 1
+            except Exception as e:
+                log.debug(f"    Desc fetch failed for job idx {idx}: {e}")
+
+    log.info(f"    Descriptions fetched: {fetched}/{len(to_fetch)}")
+    return jobs
+
+
 # -- Supabase (optional) ------------------------------------------------------
 
 def upsert_to_supabase(jobs: list[dict]) -> None:
@@ -358,8 +472,10 @@ def scrape_role(
     country: str,
     hours_old: int | None,
     global_seen_ids: set[str],
-    max_results: int = 1000,
+    max_results: int = 999999,
     base_delay_sec: float = BASE_DELAY_SEC,
+    fetch_description: bool = True,
+    desc_workers: int = DESC_WORKERS,
 ) -> tuple[list[dict], dict]:
     """
     Scrape Indeed for one role title.
@@ -500,6 +616,11 @@ def scrape_role(
             f"(role running total: {len(all_jobs)})"
         )
 
+        # Parallel description fetch for this page's new jobs
+        if fetch_description and new_in_batch > 0:
+            page_new = all_jobs[-new_in_batch:]
+            all_jobs[-new_in_batch:] = async_fetch_descriptions(page_new, workers=desc_workers)
+
         # Short page = last page
         if batch_len < BATCH_SIZE:
             log.info(f"    Short page ({batch_len} < {BATCH_SIZE}) — last page.")
@@ -563,23 +684,25 @@ def main() -> None:
                         help="Enable Supabase upsert if credentials are set (disabled by default)")
     args = parser.parse_args()
 
-    global JSON_FILE, CSV_FILE, STATE_FILE
+    global JSON_FILE, CSV_FILE, STATE_FILE, JSON_STRICT_FILE, CSV_STRICT_FILE
     if args.shard:
         shard_label = args.shard.replace("/", "-")
-        JSON_FILE  = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs.json"
-        CSV_FILE   = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs.csv"
-        STATE_FILE = OUTPUT_DIR / f"indeed_shard_{shard_label}_state.json"
+        JSON_FILE        = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs.json"
+        CSV_FILE         = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs.csv"
+        JSON_STRICT_FILE = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs_strict.json"
+        CSV_STRICT_FILE  = OUTPUT_DIR / f"indeed_shard_{shard_label}_jobs_strict.csv"
+        STATE_FILE       = OUTPUT_DIR / f"indeed_shard_{shard_label}_state.json"
 
     hours_old    = args.hours if args.hours is not None else POST_TIME_MAP.get(args.post_time)
     use_supabase = args.use_supabase
 
     if not args.max_results or str(args.max_results).lower() in ("all", "max", "0"):
-        max_results = 1000
+        max_results = 999999  # fetch all; pagination ends on short page
     else:
         try:
             max_results = max(1, int(args.max_results))
         except ValueError:
-            max_results = 1000
+            max_results = 999999
 
     role_cd_min  = 2 if args.fast else ROLE_COOLDOWN_MIN
     role_cd_max  = 5 if args.fast else ROLE_COOLDOWN_MAX
@@ -661,6 +784,8 @@ def main() -> None:
                 global_seen_ids=global_seen_ids,
                 max_results=max_results,
                 base_delay_sec=base_delay,
+                fetch_description=True,
+                desc_workers=DESC_WORKERS,
             )
         except KeyboardInterrupt:
             log.warning("\nInterrupted — saving state...")
@@ -692,6 +817,8 @@ def main() -> None:
         state["seen_ids"]        = list(global_seen_ids)
         save_state(state)
 
+    export_strict_datasets()
+
     log.info("\n" + "=" * 65)
     log.info("SCRAPER COMPLETE")
     log.info(f"  Roles processed : {len(completed)}")
@@ -699,6 +826,7 @@ def main() -> None:
     log.info(f"  Total jobs      : {grand_total}")
     log.info(f"  JSON            : {JSON_FILE}")
     log.info(f"  CSV             : {CSV_FILE}")
+    log.info(f"  Strict CSV      : {CSV_STRICT_FILE}")
     log.info("=" * 65)
 
 
@@ -715,6 +843,7 @@ def _flush(
         append_jobs_to_disk(run_jobs)
         if use_supabase:
             upsert_to_supabase(run_jobs)
+    export_strict_datasets()
     state["completed_roles"] = list(completed)
     state["total_jobs"]      = grand_total
     state["seen_ids"]        = list(seen_ids)

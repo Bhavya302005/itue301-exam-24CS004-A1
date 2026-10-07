@@ -68,6 +68,8 @@ import random
 import hashlib
 import logging
 import argparse
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Any
@@ -182,17 +184,22 @@ ROLES: list[str] = [
 
 # -- Rate-limit / retry tuning ------------------------------------------------
 # LinkedIn is MORE aggressive than Indeed. Cooldowns are intentionally higher.
-BATCH_SIZE           = 25     # jobs per LinkedIn API call (lower than Indeed for safety)
-MAX_RESULTS_PER_ROLE = 1000   # LinkedIn's practical cap per query via JobSpy
+BATCH_SIZE           = 50     # jobs per LinkedIn API call
+MAX_RESULTS_PER_ROLE = 999999 # effectively unlimited; pagination stops on short page
 MAX_RETRIES          = 5      # non-429 retries per batch
 MAX_429_PAUSES       = 3      # 429-specific pauses before giving up on a batch
-BASE_DELAY_SEC       = 6      # baseline sleep between pages (seconds) — higher than Indeed
-ROLE_COOLDOWN_MIN    = 20     # min sleep between roles (normal)
-ROLE_COOLDOWN_MAX    = 40     # max sleep between roles (normal)
+BASE_DELAY_SEC       = 5      # baseline sleep between pages (seconds)
+ROLE_COOLDOWN_MIN    = 15     # min sleep between roles (normal)
+ROLE_COOLDOWN_MAX    = 30     # max sleep between roles (normal)
 HOT_COOLDOWN_MIN     = 90     # min sleep after a 429 event
 HOT_COOLDOWN_MAX     = 150    # max sleep after a 429 event
 HOT_STREAK_ROLES     = 4      # roles to stay on hot cooldown after a 429
 BACKOFF_429_SEC      = 360    # hard 6-min pause on 429 detection (longer than Indeed)
+
+# -- Parallel description fetching --------------------------------------------
+DESC_WORKERS         = 32     # concurrent threads for description fetching
+DESC_TIMEOUT         = 15     # seconds per description request
+DESC_RETRIES         = 2      # retries per failed description fetch
 
 # -- Post-time mapping --------------------------------------------------------
 # LinkedIn JobSpy uses hours_old for recency filtering (same as Indeed).
@@ -210,9 +217,11 @@ POST_TIME_MAP: dict[str, int | None] = {
 OUTPUT_DIR = Path(__file__).parent / "linkedin_jobs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-JSON_FILE  = OUTPUT_DIR / "linkedin_68roles_jobs_us.json"
-CSV_FILE   = OUTPUT_DIR / "linkedin_68roles_jobs_us.csv"
-STATE_FILE = OUTPUT_DIR / "linkedin_68roles_state.json"
+JSON_FILE        = OUTPUT_DIR / "linkedin_68roles_jobs_us.json"
+CSV_FILE         = OUTPUT_DIR / "linkedin_68roles_jobs_us.csv"
+JSON_STRICT_FILE = OUTPUT_DIR / "linkedin_68roles_jobs_us_strict.json"
+CSV_STRICT_FILE  = OUTPUT_DIR / "linkedin_68roles_jobs_us_strict.csv"
+STATE_FILE       = OUTPUT_DIR / "linkedin_68roles_state.json"
 
 # -- Logging ------------------------------------------------------------------
 logging.basicConfig(
@@ -333,6 +342,130 @@ def append_jobs_to_disk(new_jobs: list[dict]) -> None:
     )
 
 
+def export_strict_datasets() -> None:
+    """Filter master dataset to only jobs where job_title strictly matches target role titles."""
+    try:
+        if not CSV_FILE.exists() or CSV_FILE.stat().st_size == 0:
+            return
+        df = pd.read_csv(CSV_FILE, escapechar="\\", low_memory=False)
+        roles_sorted = sorted([r.lower() for r in ROLES], key=len, reverse=True)
+        pattern = re.compile(r'\b(' + '|'.join(re.escape(r) for r in roles_sorted) + r')\b', re.IGNORECASE)
+        df_strict = df[df['job_title'].astype(str).apply(lambda t: bool(pattern.search(t)))].copy()
+        df_strict['Index_No'] = range(1, len(df_strict) + 1)
+        df_strict.to_csv(CSV_STRICT_FILE, index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
+
+        if JSON_FILE.exists() and JSON_FILE.stat().st_size > 0:
+            with open(JSON_FILE, "r", encoding="utf-8") as f:
+                jobs = json.load(f)
+            strict_jobs = [j for j in jobs if pattern.search(str(j.get("job_title", "")))]
+            with open(JSON_STRICT_FILE, "w", encoding="utf-8") as f:
+                json.dump(strict_jobs, f, indent=2, ensure_ascii=False)
+        log.info(f"Strict dataset updated: {len(df_strict)} jobs saved to {CSV_STRICT_FILE.name}")
+    except Exception as e:
+        log.warning(f"Could not export strict dataset: {e}")
+
+
+# -- Parallel description fetching -------------------------------------------
+
+def _fetch_one_description(url: str) -> str:
+    """
+    Fetch the full text description from a LinkedIn job URL.
+    Tries to extract the description div from the HTML.
+    Returns empty string on failure.
+    """
+    try:
+        import httpx
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        for attempt in range(DESC_RETRIES + 1):
+            try:
+                resp = httpx.get(url, headers=headers, timeout=DESC_TIMEOUT, follow_redirects=True)
+                if resp.status_code == 200:
+                    text = resp.text
+                    # Extract description from LinkedIn's HTML
+                    # Try the main description section first
+                    patterns = [
+                        r'<div[^>]*class="[^"]*description__text[^"]*"[^>]*>(.*?)</div>',
+                        r'<section[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</section>',
+                        r'<div[^>]*data-test-id="job-description"[^>]*>(.*?)</div>',
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+                        if match:
+                            raw = match.group(1)
+                            # Strip HTML tags
+                            clean = re.sub(r'<[^>]+>', ' ', raw)
+                            clean = re.sub(r'\s+', ' ', clean).strip()
+                            if len(clean) > 100:
+                                return clean[:8000]
+                    # Fallback: look for JSON-LD structured data
+                    jld = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', text, re.DOTALL)
+                    if jld:
+                        try:
+                            import json as _json
+                            data = _json.loads(jld.group(1))
+                            desc = data.get("description", "")
+                            if desc:
+                                clean = re.sub(r'<[^>]+>', ' ', desc)
+                                clean = re.sub(r'\s+', ' ', clean).strip()
+                                return clean[:8000]
+                        except Exception:
+                            pass
+                elif resp.status_code == 429:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+            except Exception:
+                if attempt < DESC_RETRIES:
+                    time.sleep(2)
+    except ImportError:
+        pass  # httpx not available
+    return ""
+
+
+def async_fetch_descriptions(
+    jobs: list[dict],
+    workers: int = DESC_WORKERS,
+) -> list[dict]:
+    """
+    Given a list of job dicts (each with 'job_url'), fetch full descriptions
+    in parallel using a thread pool. Updates description field in-place.
+    Only fetches for jobs with empty/short descriptions.
+    """
+    to_fetch = [
+        (i, j) for i, j in enumerate(jobs)
+        if not j.get("description") or len(str(j.get("description", ""))) < 200
+    ]
+    if not to_fetch:
+        return jobs
+
+    log.info(f"    Fetching descriptions for {len(to_fetch)} jobs via {workers} threads...")
+    fetched = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_idx = {
+            pool.submit(_fetch_one_description, j["job_url"]): i
+            for i, j in to_fetch
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                desc = future.result()
+                if desc:
+                    jobs[idx]["description"] = desc
+                    fetched += 1
+            except Exception as e:
+                log.debug(f"    Desc fetch failed for job idx {idx}: {e}")
+
+    log.info(f"    Descriptions fetched: {fetched}/{len(to_fetch)}")
+    return jobs
+
+
 # -- Supabase (optional) ------------------------------------------------------
 
 def upsert_to_supabase(jobs: list[dict]) -> None:
@@ -378,8 +511,9 @@ def scrape_role(
     hours_old: int | None,
     global_seen_ids: set[str],
     fetch_description: bool,
-    max_results: int = 1000,
+    max_results: int = 999999,
     base_delay_sec: float = BASE_DELAY_SEC,
+    desc_workers: int = DESC_WORKERS,
 ) -> tuple[list[dict], dict]:
     """
     Scrape LinkedIn for one role title.
@@ -413,7 +547,8 @@ def scrape_role(
                     "location":                 location,
                     "results_wanted":           BATCH_SIZE,
                     "offset":                   offset,
-                    "linkedin_fetch_description": fetch_description,
+                    # Always False here — we fetch descriptions in parallel below
+                    "linkedin_fetch_description": False,
                     "verbose":                  0,
                 }
                 if hours_old is not None:
@@ -520,6 +655,11 @@ def scrape_role(
             f"(role running total: {len(all_jobs)})"
         )
 
+        # Parallel description fetch for this page's new jobs
+        if fetch_description and new_in_batch > 0:
+            page_new = all_jobs[-new_in_batch:]
+            all_jobs[-new_in_batch:] = async_fetch_descriptions(page_new, workers=desc_workers)
+
         # Short page = last page (LinkedIn signals end of results this way)
         if batch_len < BATCH_SIZE:
             log.info(f"    Short page ({batch_len} < {BATCH_SIZE}) — last page.")
@@ -611,24 +751,26 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    global JSON_FILE, CSV_FILE, STATE_FILE
+    global JSON_FILE, CSV_FILE, STATE_FILE, JSON_STRICT_FILE, CSV_STRICT_FILE
     if args.shard:
         shard_label = args.shard.replace("/", "-")
-        JSON_FILE  = OUTPUT_DIR / f"linkedin_shard_{shard_label}_jobs.json"
-        CSV_FILE   = OUTPUT_DIR / f"linkedin_shard_{shard_label}_jobs.csv"
-        STATE_FILE = OUTPUT_DIR / f"linkedin_shard_{shard_label}_state.json"
+        JSON_FILE        = OUTPUT_DIR / f"linkedin_shard_{shard_label}_jobs.json"
+        CSV_FILE         = OUTPUT_DIR / f"linkedin_shard_{shard_label}_jobs.csv"
+        JSON_STRICT_FILE = OUTPUT_DIR / f"linkedin_shard_{shard_label}_jobs_strict.json"
+        CSV_STRICT_FILE  = OUTPUT_DIR / f"linkedin_shard_{shard_label}_jobs_strict.csv"
+        STATE_FILE       = OUTPUT_DIR / f"linkedin_shard_{shard_label}_state.json"
 
     hours_old        = args.hours if args.hours is not None else POST_TIME_MAP.get(args.post_time)
     use_supabase     = args.use_supabase
     fetch_description = not args.no_descriptions
 
     if not args.max_results or str(args.max_results).lower() in ("all", "max", "0"):
-        max_results = 1000
+        max_results = 999999  # fetch all available; pagination ends on short page
     else:
         try:
             max_results = max(1, int(args.max_results))
         except ValueError:
-            max_results = 1000
+            max_results = 999999
 
     role_cd_min      = 3 if args.fast else ROLE_COOLDOWN_MIN
     role_cd_max      = 6 if args.fast else ROLE_COOLDOWN_MAX
@@ -710,6 +852,7 @@ def main() -> None:
                 fetch_description=fetch_description,
                 max_results=max_results,
                 base_delay_sec=base_delay,
+                desc_workers=DESC_WORKERS,
             )
         except KeyboardInterrupt:
             log.warning("\nInterrupted — saving state...")
@@ -741,6 +884,8 @@ def main() -> None:
         state["seen_ids"]        = list(global_seen_ids)
         save_state(state)
 
+    export_strict_datasets()
+
     log.info("\n" + "=" * 65)
     log.info("SCRAPER COMPLETE")
     log.info(f"  Roles processed : {len(completed)}")
@@ -748,6 +893,7 @@ def main() -> None:
     log.info(f"  Total jobs      : {grand_total}")
     log.info(f"  JSON            : {JSON_FILE}")
     log.info(f"  CSV             : {CSV_FILE}")
+    log.info(f"  Strict CSV      : {CSV_STRICT_FILE}")
     log.info("=" * 65)
 
 
@@ -764,6 +910,7 @@ def _flush(
         append_jobs_to_disk(run_jobs)
         if use_supabase:
             upsert_to_supabase(run_jobs)
+    export_strict_datasets()
     state["completed_roles"] = list(completed)
     state["total_jobs"]      = grand_total
     state["seen_ids"]        = list(seen_ids)
