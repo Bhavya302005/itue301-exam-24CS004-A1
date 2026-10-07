@@ -248,6 +248,23 @@ jobs:
           else:
               print('No Indeed shard files found.')
 
+          # 3. Combine BOTH platforms into 2 single master files
+          combined_all = []
+          seen_all = set()
+          for j in (li_jobs + ind_jobs):
+              key = (str(j.get('job_title', '')).strip().lower() + '|' +
+                     str(j.get('company', '')).strip().lower() + '|' +
+                     str(j.get('location', '')).strip().lower())
+              if key not in seen_all:
+                  seen_all.add(key)
+                  combined_all.append(j)
+
+          combined_strict = [j for j in combined_all if strict_pattern.search(str(j.get('job_title', '')))]
+
+          write_csv(combined_all, 'all_68roles_jobs_us.csv')
+          write_csv(combined_strict, 'all_68roles_jobs_us_strict.csv')
+          print(f'Combined: {len(combined_all)} all jobs, {len(combined_strict)} strict jobs across both platforms.')
+
           # Clean up any non-CSV / unnecessary files from output dirs
           for directory, prefix in [('linkedin/linkedin_jobs', 'linkedin'), ('indeed/indeed_jobs', 'indeed')]:
               if os.path.exists(directory):
@@ -265,6 +282,7 @@ jobs:
         with:
           name: master-merged-csvs
           path: |
+            all_68roles_jobs_us*.csv
             linkedin/linkedin_jobs/*.csv
             indeed/indeed_jobs/*.csv
           if-no-files-found: warn
@@ -275,5 +293,5 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "⚡ Turbo Scrape — 2 Master CSVs (All Roles & Strict Matching) 🤖"
-          file_pattern: 'linkedin/linkedin_jobs/*.csv indeed/indeed_jobs/*.csv'
+          file_pattern: 'all_68roles_jobs_us*.csv linkedin/linkedin_jobs/*.csv indeed/indeed_jobs/*.csv'
           commit_author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
